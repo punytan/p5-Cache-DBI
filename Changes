@@ -1,4 +1,7 @@
 Revision history for Perl extension Cache::DBI
 
+0.02    Wed Jul 27 16:12:21 JST 2011
+        - initial implementation
+
 0.01    Wed Jul 27 10:48:34 2011
         - original version
