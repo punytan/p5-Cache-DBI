@@ -21,12 +21,4 @@ my $mysqld = Test::mysqld->new(
     isa_ok $cache, 'Cache::DBI';
 }
 
-{
-    my $cache = Cache::DBI->new(
-        dbh => DBI->connect($mysqld->dsn),
-    );
-
-    isa_ok $cache, 'Cache::DBI';
-}
-
 done_testing;

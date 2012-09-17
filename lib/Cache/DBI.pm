@@ -4,99 +4,90 @@ use warnings;
 our $VERSION = '0.02';
 
 use Carp;
-use Storable;
-use MIME::Base64 ();
-use Try::Tiny;
-use Time::Piece ();
+use Data::MessagePack;
 
 sub new {
     my ($class, %args) = @_;
 
-    my $dbh;
-    if (my $conn = $args{connector}) {
-        $dbh = sub { $conn->dbh };
-    } elsif (my $dbi_handle = $args{dbh}) {
-        $dbh = sub { $dbi_handle };
-    } else {
-        Carp::croak "Couldn't find DBI handle";
-    }
+    my $connector = $args{connector}
+        or Carp::croak "Couldn't find DBI handle";
 
-    my $namespace = $args{namespace} || 'cache_dbi';
+    my $serializer = $args{serializer}
+        || Data::MessagePack->new->prefer_integer->canonical(0)->utf8;
 
-    my $serializer = $args{serializer} || sub {
-        MIME::Base64::encode_base64( Storable::nfreeze(shift) );
-    };
 
-    my $deserializer = $args{deserializer} || sub {
-        Storable::thaw( MIME::Base64::decode_base64(shift) );
-    };
+    my $table = $args{table} || 'cache_dbi';
+
+    my $delete = "DELETE FROM $table WHERE id = ?";
+    my $get    = "SELECT id, value, expires_at FROM $table WHERE id = ?";
+    my $set    = <<SQL;
+INSERT INTO $table
+    (id, value, expires_at)
+VALUES
+    (?, ?, ?)
+ON DUPLICATE KEY UPDATE
+    value      = VALUES(value),
+    expires_at = VALUES(expires_at)
+SQL
 
     return bless {
-        dbh => $dbh,
-        serializer   => $serializer,
-        deserializer => $deserializer,
-        namespace    => $namespace,
-        sql => {
-            set => {
-                select => "SELECT 1 FROM $namespace WHERE id = ?",
-                update => "UPDATE $namespace SET value = ?, expire_at = ? WHERE id = ?",
-                insert => "INSERT INTO $namespace (id, value, expire_at) VALUES (?, ?, ?)",
-            },
-            get    => { select => "SELECT * FROM $namespace WHERE id = ?" },
-            delete => { delete => "DELETE FROM $namespace WHERE id = ?" },
+        connector  => $connector,
+        serializer => $serializer,
+        table => $table,
+        sql   => {
+            set    => $set,
+            get    => $get,
+            delete => $delete,
         },
     }, $class;
 }
 
-sub prepare_cached { shift->{dbh}->()->prepare_cached(@_) }
+sub connector  { shift->{connector}  }
+sub serializer { shift->{serializer} }
 
 sub get {
     my ($self, $key) = @_;
 
-    my $sth = $self->prepare_cached($self->{sql}{get}{select});
-    $sth->execute($key);
+    $self->connector->txn(
+        fixup => sub {
+            my $dbh = shift;
+            my $row = $dbh->selectrow_hashref($self->{sql}{get}, undef, $key)
+                or return;
 
-    my ($row) = $sth->fetchrow_hashref;
-    $sth->finish;
-
-    return if not $row;
-
-    if ($row->{expire_at} < Time::Piece->gmtime->epoch) {
-        $self->delete($key);
-        return;
-    } else {
-        return $self->{deserializer}->($row->{value});
-    }
+            if ($row->{expires_at} > time) {
+                return $self->serializer->decode($row->{value});
+            } else {
+                $dbh->do($self->{sql}{delete}, undef, $key);
+                $dbh->commit;
+                return;
+            }
+        }
+    );
 }
 
 sub set {
-    my ($self, $key, $value, $expire_after) = @_;
-    $expire_after ||= 60;
+    my ($self, $key, $value, $expires_after) = @_;
+    my $expires_at = time + ($expires_after || 60);
+    my $serialized = $self->serializer->encode($value);
 
-    my $sth = $self->prepare_cached($self->{sql}{set}{select});
-    $sth->execute($key);
-
-    my ($exists) = $sth->fetchrow_hashref;
-    $sth->finish;
-
-    my $val = $self->{serializer}->($value);
-    my $expire_at = Time::Piece->gmtime->epoch + $expire_after;
-
-    my @bind = $exists
-        ? ($val, $expire_at, $key)
-        : ($key, $val, $expire_at);
-
-    my $type = $exists ? 'update' : 'insert';
-    my $sth2 = $self->prepare_cached($self->{sql}{set}{$type});
-    $sth2->execute(@bind);
+    $self->connector->txn(
+        fixup => sub {
+            my $dbh = shift;
+            $dbh->do($self->{sql}{set}, undef, $key, $serialized, $expires_at);
+            $dbh->commit;
+        }
+    );
 }
 
 sub delete {
     my ($self, $key) = @_;
-
-    my $sth = $self->prepare_cached($self->{sql}{delete}{delete});
-    $sth->execute($key);
-    $sth->finish;
+    $self->connector->txn(
+        fixup => sub {
+            my $dbh = shift;
+            $dbh->do($self->{sql}{delete}, undef, $key);
+            $dbh->commit;
+        }
+    );
 }
 
 sub incr { Carp::croak "TBD" }
@@ -123,7 +114,7 @@ Cache::DBI is
     CREATE TABLE IF NOT EXISTS `cache_dbi` (
         `id`        VARCHAR(64) NOT NULL PRIMARY KEY,
         `value`     TEXT,
-        `expire_at` BIGINT UNSIGNED NOT NULL
+        `expires_at` BIGINT UNSIGNED NOT NULL
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
 
 =head1 AUTHOR
